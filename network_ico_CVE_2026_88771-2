@@ -1,0 +1,175 @@
+=============================================================================
+ PALO ALTO (PAN-OS / Panorama) - IOC-hunt Citrix NetScaler
+ CVE-2026-88771 / CVE-2026-88772 (Citrix CTX697096)
+ Stand: 1 oktober 2026
+=============================================================================
+
+GEBRUIK
+- Plak de filters in: Monitor > Logs > Traffic / Threat / URL Filtering
+  (of Panorama > Monitor met de juiste Device Group).
+- Zet het tijdsbereik op "All" of gebruik het receive_time-filter;
+  exploitatie loopt sinds begin september (eSentire: 5 sep).
+- Vervang <NSIP>, <SNIP> en <GATEWAY_VIP> door de adressen van jullie NetScalers.
+- Zoneamen (untrust) aanpassen aan jullie configuratie.
+- Een treffer is een onderzoeksaanleiding, geen bewijs van compromittering.
+  Geen treffer betekent ook niet dat het schoon is (IP's wisselen snel).
+
+-----------------------------------------------------------------------------
+IOC-IP's (16)
+-----------------------------------------------------------------------------
+149.104.78.141    GreyNoise         exploitatie 88771 (24 sep, pre-disclosure)
+70.172.58.168     LevelBlue         bron exploitatiepogingen
+162.243.36.88     LevelBlue         bron exploitatiepogingen
+173.40.135.209    LevelBlue         bron exploitatiepogingen
+47.230.224.154    LevelBlue         bron exploitatiepogingen
+92.118.204.229    LevelBlue         command-execution tests
+87.224.84.82      LevelBlue         config-staging poging
+23.27.143.20      LevelBlue         exploit-bron + payload host (TCP/9000 main.py)
+62.133.62.80      LevelBlue         payload host (TCP/80 /xd7h/x)
+64.94.85.67       LevelBlue         payload + exfiltratie (TCP/443)
+31.56.197.72      LevelBlue         payload host (TCP/9090 /lula)
+45.141.21.130     LevelBlue         reverse-shell C2 (TCP/443)
+138.199.200.90    Lupovis           exfiltratie-server (Hetzner)
+154.217.251.226   Lupovis/Beazley   88772 scanning
+143.198.7.94      Mandiant/GTIG     scanning + staging
+157.254.167.12    Mandiant/GTIG     exploitatie + webshell-installatie
+
+Domein: *.instances.httpworkbench.com (Lupovis: DNS-lookup = host is al geraakt)
+
+
+=============================================================================
+QUERY 1 - TRAFFIC LOG: alle verkeer van/naar IOC-IP's   (hoofdquery)
+=============================================================================
+( receive_time geq '2026/09/01 00:00:00' ) and ( ( addr in 149.104.78.141 ) or ( addr in 70.172.58.168 ) or ( addr in 162.243.36.88 ) or ( addr in 173.40.135.209 ) or ( addr in 47.230.224.154 ) or ( addr in 92.118.204.229 ) or ( addr in 87.224.84.82 ) or ( addr in 23.27.143.20 ) or ( addr in 62.133.62.80 ) or ( addr in 64.94.85.67 ) or ( addr in 31.56.197.72 ) or ( addr in 45.141.21.130 ) or ( addr in 138.199.200.90 ) or ( addr in 154.217.251.226 ) or ( addr in 143.198.7.94 ) or ( addr in 157.254.167.12 ) )
+
+Beoordeling:
+- action = allow + bytes > enkele KB  -> sessie is tot stand gekomen: prioriteit.
+- Inbound naar Gateway VIP            -> exploitatiepoging.
+- OUTBOUND vanaf NSIP/SNIP            -> HOOG: payload-download, C2 of exfiltratie
+                                         => appliance waarschijnlijk gecompromitteerd.
+
+
+=============================================================================
+QUERY 2 - TRAFFIC LOG: OUTBOUND vanaf NetScaler naar IOC-IP's   (kritiek)
+=============================================================================
+( addr.src in <NSIP> or addr.src in <SNIP> ) and ( ( addr.dst in 23.27.143.20 ) or ( addr.dst in 62.133.62.80 ) or ( addr.dst in 64.94.85.67 ) or ( addr.dst in 31.56.197.72 ) or ( addr.dst in 45.141.21.130 ) or ( addr.dst in 138.199.200.90 ) or ( addr.dst in 143.198.7.94 ) or ( addr.dst in 157.254.167.12 ) )
+
+Specifieke payload/C2-poorten (LevelBlue):
+( addr.dst in 45.141.21.130 and port.dst eq 443 ) or ( addr.dst in 64.94.85.67 and port.dst eq 443 ) or ( addr.dst in 31.56.197.72 and port.dst eq 9090 ) or ( addr.dst in 23.27.143.20 and port.dst eq 9000 ) or ( addr.dst in 62.133.62.80 and port.dst eq 80 )
+
+
+=============================================================================
+QUERY 3 - THREAT LOG: IOC-IP's
+=============================================================================
+Zelfde filter als Query 1, maar in Monitor > Logs > Threat.
+Let vooral op threat-namen met "NetScaler", "Citrix", "Command Injection"
+of "Generic ${IFS}". Controleer of Threat Prevention content up-to-date is
+en zoek naar de Palo Alto threat-ID's voor CVE-2026-88771/88772 in
+Objects > Security Profiles > Vulnerability Protection (zoek op "CVE-2026-8877").
+
+( receive_time geq '2026/09/01 00:00:00' ) and ( ( name-of-threatid contains 'NetScaler' ) or ( name-of-threatid contains 'Citrix' ) )
+
+
+=============================================================================
+QUERY 4 - URL FILTERING / DNS: payload-URL's en httpworkbench-domein
+=============================================================================
+URL Filtering log:
+( url contains 'httpworkbench.com' ) or ( url contains '23.27.143.20' ) or ( url contains '62.133.62.80' ) or ( url contains '64.94.85.67' ) or ( url contains '31.56.197.72' ) or ( url contains 'update_c08937' ) or ( url contains 'update_result_3567cs' ) or ( url contains 'main.py' ) or ( url contains 'xd7h/x' )
+
+Threat log (DNS Security / sinkhole):
+( name-of-threatid contains 'httpworkbench' ) or ( misc contains 'httpworkbench.com' )
+
+
+=============================================================================
+QUERY 5 - ANOMALE EGRESS vanaf NetScaler (onafhankelijk van IOC-IP's)
+=============================================================================
+Een NetScaler hoort naar internet alleen DNS, NTP, OCSP/CRL en Citrix te praten.
+Alles daarbuiten is verdacht. Aanbevolen door Mandiant, omdat aanvallers
+per slachtoffer wisselende infrastructuur gebruiken.
+
+( addr.src in <NSIP> or addr.src in <SNIP> ) and ( zone.dst eq untrust ) and !( port.dst eq 53 ) and !( port.dst eq 123 ) and ( action eq allow )
+
+Extra aandacht (Mandiant):
+( addr.src in <NSIP> or addr.src in <SNIP> ) and ( port.dst eq 25 )
+
+
+=============================================================================
+QUERY 6 - INBOUND UDP/443 (DTLS) naar Gateway   (CVE-2026-88772)
+=============================================================================
+( addr.dst in <GATEWAY_VIP> ) and ( proto eq udp ) and ( port.dst eq 443 ) and ( receive_time geq '2026/09/01 00:00:00' )
+
+Let op: korte bursts vanaf één bron. Exploitatie vraagt weinig verkeer,
+dus volume alleen zegt weinig. Correleer met NSPPE-crashes in de NetScaler-logs.
+
+
+=============================================================================
+QUERY 7 - LATERALE BEWEGING vanaf NetScaler naar intern
+=============================================================================
+SLAPSHOT tunnelt verkeer het interne netwerk in (verkenning, credential theft).
+
+( addr.src in <NSIP> or addr.src in <SNIP> ) and ( zone.dst neq untrust ) and ( ( port.dst eq 445 ) or ( port.dst eq 3389 ) or ( port.dst eq 5985 ) or ( port.dst eq 5986 ) or ( port.dst eq 22 ) or ( port.dst eq 135 ) or ( port.dst eq 389 ) or ( port.dst eq 636 ) or ( port.dst eq 88 ) )
+
+Vergelijk met de normale baseline (LDAP/RADIUS naar DC's is legitiem,
+SMB/RDP/WinRM normaal gesproken niet).
+
+
+=============================================================================
+XML-API - logs exporteren voor rapportage/SIEM
+=============================================================================
+# 1. Job starten (traffic log, query 1)
+KEY='<API-key>'
+FW='<firewall-of-panorama>'
+curl -sk -G "https://$FW/api/" -H "X-PAN-KEY: $KEY" \
+  --data-urlencode "type=log" \
+  --data-urlencode "log-type=traffic" \
+  --data-urlencode "nlogs=5000" \
+  --data-urlencode "query=( addr in 149.104.78.141 ) or ( addr in 45.141.21.130 ) or ( addr in 64.94.85.67 )"
+#    -> response bevat <job>JOB_ID</job>
+
+# 2. Resultaat ophalen (herhalen tot status FIN)
+curl -sk -G "https://$FW/api/" -H "X-PAN-KEY: $KEY" \
+  --data-urlencode "type=log" \
+  --data-urlencode "action=get" \
+  --data-urlencode "job-id=JOB_ID" > ioc_traffic.xml
+
+Voor log-type=threat of log-type=url hetzelfde, met de bijbehorende query.
+
+
+=============================================================================
+BLOKKEREN - External Dynamic List (EDL)
+=============================================================================
+Zet onderstaande IP's in een tekstbestand op een interne webserver en maak
+Objects > External Dynamic Lists > type "IP List". Gebruik de EDL in een
+deny-regel bovenaan (bron EN bestemming) en log de hits.
+Blokkeren is een aanvullende maatregel, geen vervanging voor patchen en hunten.
+
+149.104.78.141
+70.172.58.168
+162.243.36.88
+173.40.135.209
+47.230.224.154
+92.118.204.229
+87.224.84.82
+23.27.143.20
+62.133.62.80
+64.94.85.67
+31.56.197.72
+45.141.21.130
+138.199.200.90
+154.217.251.226
+143.198.7.94
+157.254.167.12
+
+Domein-EDL (type "Domain List"):
+*.instances.httpworkbench.com
+
+
+=============================================================================
+BRONNEN
+=============================================================================
+LevelBlue SpiderLabs  - https://www.levelblue.com/blogs/spiderlabs-blog/citrix-netscaler-cve-2026-88771-observed-exploitation-artifacts-and-hunt-indicators
+GreyNoise             - https://www.greynoise.io/blog/swarming-against-citrix-0-day-exploitation
+Mandiant / GTIG       - https://cloud.google.com/blog/topics/threat-intelligence/defending-against-active-exploitation-of-citrix-netscaler-adc-and-gateway-appliances
+Lupovis (Help Net)    - https://www.helpnetsecurity.com/2026/09/29/netscaler-zero-day-exploitation-escalates-into-mass-attacks-cve-2026-88771/
+Beazley Security      - https://beazley.security/alerts-advisories/critical-vulnerability-in-citrix-netscaler-zero-day-prompts-emergency-shutdowns-cve-2026-88771-cve-2026-88772
+CERT-EU               - https://www.cert.europa.eu/blog/taking-execute-logging-a-bit-too-literally-cve-2026-88771
