@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  rme_netscaler_ioc_check.sh
+#  droba1987 - Disclaimer USE @ OWN RISK
+#  IOC-/compromise-check Citrix NetScaler ADC / Gateway
+#  CVE-2026-88771 (pre-auth command injection, log poisoning via ns_monuploadd_err.pl)
+#  CVE-2026-88772 (DTLS memory overflow in NSPPE)  -  Citrix bulletin CTX697096
+#
+#  Bronnen (stand 1 okt 2026): Citrix CTX697096, Mandiant/GTIG, GreyNoise,
+#  LevelBlue SpiderLabs, CERT-EU, Lupovis, watchTowr, PenTestIT, NCSC-NL.
+#
+#  
+#      bash netscaler_ioc_check.sh                 # default: sinds 2026-08-15
+#      bash netscaler_ioc_check.sh 2026-09-01      # eigen startdatum (YYYY-MM-DD)
+#
+#  - Het script is READ-ONLY: het wijzigt niets op de appliance.
+#  - Maak EERST een snapshot / memory dump en kopieer logs (NCSC-NL advies),
+#    daarna dit script draaien, daarna patchen. Draai op BEIDE HA-nodes.
+#  - Een schone uitkomst sluit compromittering NIET uit: aanvallers gebruiken
+#    per slachtoffer unieke webshells en ruimen artefacten op.
+#  - Rapport: /var/tmp/ioc_report_<hostname>_<timestamp>.txt
+# =============================================================================
+
+set -u
+SINCE="${1:-2026-08-15}"
+HOST="$(hostname 2>/dev/null || echo netscaler)"
+TS="$(date +%Y%m%d_%H%M%S)"
+REPORT="/var/tmp/ioc_report_${HOST}_${TS}.txt"
+MAXLINES=40
+
+HIGH=0; MED=0; INFO=0
+
+# ----------------------------------------------------------------------------- 
+# IOC-lijsten
+# -----------------------------------------------------------------------------
+# Netwerk-IOC's (exploitatie, payload-hosting, C2, exfiltratie)
+IOC_IPS="
+149.104.78.141|GreyNoise: exploitatie 88771 (24 sep, pre-disclosure)
+70.172.58.168|LevelBlue: bron exploitatiepogingen
+162.243.36.88|LevelBlue: bron exploitatiepogingen
+173.40.135.209|LevelBlue: bron exploitatiepogingen
+47.230.224.154|LevelBlue: bron exploitatiepogingen
+92.118.204.229|LevelBlue: command-execution tests
+87.224.84.82|LevelBlue: config-staging poging
+23.27.143.20|LevelBlue: exploit-bron + payload host (main.py :9000)
+62.133.62.80|LevelBlue: payload host (/xd7h/x :80)
+64.94.85.67|LevelBlue: payload + exfil (update_c08937.pl :443)
+31.56.197.72|LevelBlue: payload host (lula :9090)
+45.141.21.130|LevelBlue: reverse-shell C2 :443 (customsnmpd)
+138.199.200.90|Lupovis: exfil-server (Hetzner)
+154.217.251.226|Lupovis/Beazley: 88772 scanning
+143.198.7.94|Mandiant/GTIG: scanning + staging
+157.254.167.12|Mandiant/GTIG: exploitatie + webshell installatie
+"
+IOC_DOMAINS="instances.httpworkbench.com"
+
+# Bekende SHA-256 hashes
+IOC_HASHES="
+e9fe43968c6c0955300e3bc4d7fb0b05a18570b4733aaf4f5c6f7f09be5a242c|main.py (reverse shell dropper, LevelBlue)
+974b69782fdf5d67b97cfd508465939e44ee10798dbcc1e82b92d78776bad938|update_c08937.pl (post-exploitatie, LevelBlue)
+ed082f744f035035900f67edf438f2f7d0528ac501234f63d476d65273cdb9a1|.ctxs.receiver webshell (r/Citrix sample)
+6f5a2a452a7901323abd21879c6cecccb47c06aeeaccb1b467212f3b11e4b1e7|.ctxs.receiver webshell (GreyNoise sample)
+"
+
+# Bekende bestandsartefacten
+IOC_FILES="
+/var/netscaler/logon/LogonPoint/custom/.ctxs.receiver|PHP webshell (GreyNoise / r/Citrix)
+/var/netscaler/logon/LogonPoint/.local_journal|PHP webshell (update_c08937.pl)
+/var/netscaler/logon/insight-new.js|ns.conf staging (LevelBlue)
+/var/netscaler/logon/LogonPoint/xua.html|nsconfig tar-archief staging (LevelBlue)
+/tmp/update_result_3567cs.tgz|nsconfig exfil-archief (update_c08937.pl)
+/tmp/.uxdport|SLAPSHOT tunneler port-file (Mandiant)
+/tmp/.uxdlock|SLAPSHOT tunneler lock-file (Mandiant)
+/var/tmp/sh|SUID shell kopie (NCSC-NL 2025 patroon)
+"
+
+# Web-/script-directories die de appliance serveert (persistent = /var en /flash)
+WEB_DIRS="/var/netscaler/logon /var/netscaler/gui /var/vpn /var/vpns /netscaler/ns_gui/vpn /netscaler/portal"
+PLUGIN_DIRS="/var/netscaler/gui/vpn/scripts/linux /var/netscaler/gui/vpns/scripts/vista /var/netscaler/gui/vpns/scripts/mac /netscaler/ns_gui/vpn/scripts/linux /netscaler/ns_gui/vpn/media /var/vpn/theme"
+HTTPD_CONFS="/etc/httpd.conf /nsconfig/httpd.conf /flash/nsconfig/httpd.conf"
+NSCONFS="/nsconfig/ns.conf /flash/nsconfig/ns.conf"
+
+# ----------------------------------------------------------------------------- 
+# Hulpfuncties
+# -----------------------------------------------------------------------------
+out()     { printf '%s\n' "$*" | tee -a "$REPORT"; }
+section() { out ""; out "=================================================================="; out "[$1] $2"; out "=================================================================="; }
+high()    { HIGH=$((HIGH+1)); out "  [HIGH]   $*"; }
+med()     { MED=$((MED+1));   out "  [MEDIUM] $*"; }
+info()    { INFO=$((INFO+1)); out "  [INFO]   $*"; }
+ok()      { out "  [OK]     $*"; }
+show()    { head -n "$MAXLINES" | sed 's/^/           | /' | tee -a "$REPORT"; }
+
+sha256_of() {
+    if command -v sha256 >/dev/null 2>&1; then sha256 -q "$1" 2>/dev/null
+    elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    else openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'; fi
+}
+
+# Grep in (ook ge-gzipte) logbestanden. Gebruik: lgrep <ERE-patroon> <bestanden...>
+lgrep() {
+    local pat="$1"; shift
+    local f
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        case "$f" in
+            *.gz) gzip -dc "$f" 2>/dev/null | grep -aEi -- "$pat" 2>/dev/null | sed "s|^|$(basename "$f"): |" ;;
+            *)    grep -aEi -- "$pat" "$f" 2>/dev/null | sed "s|^|$(basename "$f"): |" ;;
+        esac
+    done
+}
+
+# Controleer een log-patroon en rapporteer met ernst
+log_hunt() { # <severity> <omschrijving> <patroon> <bestanden...>
+    local sev="$1" desc="$2" pat="$3"; shift 3
+    local hits n
+    hits="$(lgrep "$pat" "$@")"
+    if [ -n "$hits" ]; then
+        n="$(printf '%s\n' "$hits" | wc -l | tr -d ' ')"
+        "$sev" "$desc ($n regels)"
+        printf '%s\n' "$hits" | show
+    else
+        ok "$desc: geen treffers"
+    fi
+}
+
+# Versievergelijking: build_lt "73.30" "73.37" -> 0 (true) als eerste kleiner is
+build_lt() {
+    local a1 a2 b1 b2
+    a1="${1%%.*}"; a2="${1#*.}"; b1="${2%%.*}"; b2="${2#*.}"
+    [ "$a1" -lt "$b1" ] && return 0
+    [ "$a1" -eq "$b1" ] && [ "$a2" -lt "$b2" ] && return 0
+    return 1
+}
+
+# Logbestanden
+NSLOGS="$(ls /var/log/ns.log* 2>/dev/null)"
+MSGLOGS="$(ls /var/log/messages* 2>/dev/null)"
+HTTPACC="$(ls /var/log/httpaccess*.log* /var/log/httpaccess* 2>/dev/null | sort -u)"
+HTTPERR="$(ls /var/log/httperror* 2>/dev/null)"
+SHLOGS="$(ls /var/log/sh.log* /var/log/bash.log* /var/log/notice.log* 2>/dev/null)"
+ALLLOGS="$NSLOGS $MSGLOGS $HTTPACC $HTTPERR $SHLOGS"
+
+# ----------------------------------------------------------------------------- 
+: > "$REPORT" 2>/dev/null || { REPORT="/tmp/ioc_report_${HOST}_${TS}.txt"; : > "$REPORT"; }
+out "NetScaler IOC-check CVE-2026-88771 / CVE-2026-88772 (CTX697096)"
+out "Host: $HOST   Datum: $(date)   Zoekvenster vanaf: $SINCE"
+out "Rapport: $REPORT"
+[ "$(id -u)" -ne 0 ] && out "  [WAARSCHUWING] Niet als root gedraaid - resultaten kunnen onvolledig zijn."
+
+# ============================================================================= 
+section 1 "Firmwareversie (kwetsbaar < 14.1-73.37 / < 13.1-64.23)"
+# =============================================================================
+VER=""
+if [ -f /flash/boot/loader.conf ]; then
+    VER="$(sed -n 's/^kernel="\/ns-\([0-9]*\.[0-9]*-[0-9]*\.[0-9]*\).*/\1/p' /flash/boot/loader.conf | head -1)"
+fi
+[ -z "$VER" ] && VER="$(ls /flash/ns-*.gz 2>/dev/null | sed -n 's/.*ns-\([0-9]*\.[0-9]*-[0-9]*\.[0-9]*\).*/\1/p' | sort | tail -1)"
+if [ -n "$VER" ]; then
+    REL="${VER%%-*}"; BLD="${VER#*-}"
+    out "  Gedetecteerde versie: $VER"
+    case "$REL" in
+        14.1) if build_lt "$BLD" "73.37"; then high "Versie $VER is KWETSBAAR (fix: 14.1-73.37 of hoger)"; else ok "Versie $VER bevat de fix (let op: FIPS-builds apart controleren)"; fi ;;
+        13.1) if build_lt "$BLD" "64.23"; then high "Versie $VER is KWETSBAAR (fix: 13.1-64.23; bij 'show ns variable' output -> 13.1-64.24)"; else ok "Versie $VER bevat de fix (13.1-FIPS/NDcPP: fix 13.1-37.279)"; fi ;;
+        *)    high "Release $REL is EOL/onbekend in CTX697096 - behandel als kwetsbaar zonder fix" ;;
+    esac
+else
+    info "Versie niet automatisch bepaald - controleer handmatig met 'show version'"
+fi
+
+# =============================================================================
+section 2 "DTLS-blootstelling (voorwaarde CVE-2026-88772)"
+# =============================================================================
+for c in $NSCONFS; do
+    [ -f "$c" ] || continue
+    d1="$(grep -E '^add vpn vserver' "$c" | grep -v -- '-dtls OFF')"
+    d2="$(grep -E '^add (vpn|lb) vserver [^ ]+ DTLS ' "$c")"
+    off="$(grep -E '^set vpn vserver .*-dtls OFF' "$c")"
+    if [ -n "$d1" ] || [ -n "$d2" ]; then
+        med "$c: VPN/DTLS vservers zonder '-dtls OFF' (blootgesteld aan 88772 tenzij via 'set' uitgezet)"
+        printf '%s\n%s\n' "$d1" "$d2" | sed '/^$/d' | show
+        [ -n "$off" ] && { out "           'set ... -dtls OFF' regels:"; printf '%s\n' "$off" | show; }
+    else
+        ok "$c: geen DTLS-blootstelling gevonden"
+    fi
+done
+
+# =============================================================================
+section 3 "Bekende IOC-bestanden"
+# =============================================================================
+FOUND_ANY=0
+while IFS='|' read -r p d; do
+    [ -z "$p" ] && continue
+    if [ -e "$p" ]; then
+        FOUND_ANY=1
+        high "GEVONDEN: $p  -> $d"
+        ls -la "$p" 2>/dev/null | show
+        [ -f "$p" ] && out "           sha256: $(sha256_of "$p")"
+        [ "$p" = "/tmp/.uxdport" ] && out "           poort in .uxdport: $(cat /tmp/.uxdport 2>/dev/null)"
+    fi
+done <<< "$IOC_FILES"
+[ "$FOUND_ANY" -eq 0 ] && ok "Geen van de bekende IOC-bestandspaden aanwezig"
+# Patroon-varianten (GreyNoise: receiver.min[.hex].css; Mandiant: nginstaller*/nsginstaller*/nsgclient*)
+VAR_HITS="$(find /var/netscaler /var/vpn /var/vpns /tmp /var/tmp \( -name '.ctxs.*' -o -name 'receiver.min*.css' -o -name '*nginstaller*' -o -name 'nsgclient*.sig' -o -name 'nsgclient*.deb' -o -name '*.sig' -o -name 'update_result_*.tgz' -o -name 'update_c*.pl' -o -name '.uxd*' -o -name '.local_journal' \) 2>/dev/null)"
+if [ -n "$VAR_HITS" ]; then
+    high "Bestanden die overeenkomen met bekende IOC-naamspatronen:"
+    printf '%s\n' "$VAR_HITS" | while read -r f; do ls -la "$f" 2>/dev/null; done | show
+else
+    ok "Geen bestanden met bekende IOC-naamspatronen"
+fi
+
+# =============================================================================
+section 4 "Apache httpd.conf manipulatie (PHP-handlers / AliasMatch)"
+# =============================================================================
+for c in $HTTPD_CONFS; do
+    [ -f "$c" ] || continue
+    out "  -- $c  (mtime: $(ls -l "$c" | awk '{print $6,$7,$8}'))"
+    h1="$(grep -nEi 'AddHandler[[:space:]]+application/x-httpd-php|AddType[[:space:]]+application/x-httpd-php' "$c" | grep -viE 'x-httpd-php[[:space:]]+\.php([[:space:]]|$)')"
+    h2="$(grep -nEi 'AliasMatch|receiver\.min|\.ctxs\.|\.local_journal|LogonUISimple\.html\.style|/vpn/media/.*\.ico|/vpn/scripts/linux|\.sig|\.deb' "$c")"
+    h3="$(grep -nEi 'php_flag[[:space:]]+engine[[:space:]]+on' "$c")"
+    if [ -n "$h1" ]; then high "$c: niet-.php extensie geregistreerd als PHP"; printf '%s\n' "$h1" | show; fi
+    if [ -n "$h2" ]; then high "$c: verdachte Alias/AliasMatch of webshell-referentie"; printf '%s\n' "$h2" | show; fi
+    if [ -n "$h3" ]; then med "$c: 'php_flag engine on' aanwezig - beoordeel context"; printf '%s\n' "$h3" | show; fi
+    [ -z "$h1$h2$h3" ] && ok "$c: geen verdachte directives"
+done
+
+# =============================================================================
+section 5 "Webshell-content in geserveerde directories"
+# =============================================================================
+EXISTING_WEB=""; for d in $WEB_DIRS; do [ -d "$d" ] && EXISTING_WEB="$EXISTING_WEB $d"; done
+if [ -n "$EXISTING_WEB" ]; then
+    # a) PHP-code in bestanden ZONDER .php extensie (masquerading: .css/.ico/.sig/.deb/.js/.html/dotfiles)
+    A="$(grep -rlaE '<\?php|passthru\(|shell_exec\(' $EXISTING_WEB 2>/dev/null | grep -vE '\.(php|phtml|inc)$')"
+    if [ -n "$A" ]; then high "PHP-code in bestanden zonder .php-extensie:"; printf '%s\n' "$A" | while read -r f; do ls -la "$f"; done | show; else ok "Geen PHP in niet-.php bestanden"; fi
+
+    # b) Typische webshell-sinks gecombineerd met NetScaler-cookies/headers
+    B="$(grep -rlaE 'NSC_TASS|HTTP_NSC_LDAP|HTTP_NSC_CLIENTTYPE|HTTP_X_UX|CsrfToken.*passthru|<FATO>|eval\(base64_decode|passthru\(urldecode|shell_exec\(base64_decode' $EXISTING_WEB /var/tmp /tmp 2>/dev/null | grep -v "$REPORT" | grep -v 'netscaler_ioc_check')"
+    if [ -n "$B" ]; then high "Webshell-signaturen (WHIPSHOT / .ctxs.receiver / NSC_* header C2):"; printf '%s\n' "$B" | show; else ok "Geen webshell-signaturen"; fi
+
+    # c) Verborgen bestanden in web-directories
+    C="$(find $EXISTING_WEB -name '.*' -type f 2>/dev/null)"
+    if [ -n "$C" ]; then med "Verborgen (dot)bestanden in web-directories:"; printf '%s\n' "$C" | while read -r f; do ls -la "$f"; done | show; else ok "Geen verborgen bestanden in web-directories"; fi
+
+    # d) Recent gewijzigde bestanden in persistente web-directories
+    D="$(find /var/netscaler/logon /var/netscaler/gui /var/vpn /var/vpns -type f -newermt "$SINCE" 2>/dev/null)"
+    if [ -n "$D" ]; then med "Bestanden gewijzigd sinds $SINCE in persistente web-dirs (vergelijk met firmware-installatie):"; printf '%s\n' "$D" | while read -r f; do ls -la "$f"; done | show; else ok "Geen recente wijzigingen in persistente web-dirs"; fi
+
+    # e) Wereldschrijfbare bestanden in LogonPoint (sample: -rw-rw-rw- root wheel)
+    E="$(find /var/netscaler/logon -type f -perm -0002 2>/dev/null)"
+    [ -n "$E" ] && { med "World-writable bestanden onder /var/netscaler/logon:"; printf '%s\n' "$E" | show; }
+fi
+
+# Plugin-/media-directories: hier horen alleen binaries/archieven
+for d in $PLUGIN_DIRS; do
+    [ -d "$d" ] || continue
+    P="$(file "$d"/* 2>/dev/null | grep -Ei 'ASCII text|PHP script|script text')"
+    [ -n "$P" ] && { high "Tekst/script-bestanden in client plugin-dir $d (verwacht: binaries):"; printf '%s\n' "$P" | show; }
+done
+
+# =============================================================================
+section 6 "Hash-vergelijking bekende malware/webshells"
+# =============================================================================
+HASHLIST="$(printf '%s\n' "$IOC_HASHES" | sed '/^$/d')"
+HASH_HIT=0
+while IFS= read -r f; do
+    h="$(sha256_of "$f")"; [ -z "$h" ] && continue
+    m="$(printf '%s\n' "$HASHLIST" | grep -i "^$h|")"
+    if [ -n "$m" ]; then high "HASH MATCH: $f -> ${m#*|}"; HASH_HIT=1; fi
+done < <(find $EXISTING_WEB /var/tmp /tmp /var/python/bin /flash/nsconfig -type f -size -5000k 2>/dev/null)
+[ "$HASH_HIT" -eq 0 ] && ok "Geen bekende hashes gevonden (verwacht: webshells zijn per slachtoffer uniek)"
+
+# =============================================================================
+section 7 "Privilege-persistentie: SUID/SGID op /bin/sh en andere shells"
+# =============================================================================
+if [ -u /bin/sh ] || [ -g /bin/sh ]; then
+    high "/bin/sh heeft SUID/SGID-bit (chmod u+s / 6555) - bekende backdoor"
+else
+    ok "/bin/sh heeft geen SUID/SGID"
+fi
+ls -l /bin/sh | show
+S="$(find /var /flash /tmp -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null)"
+if [ -n "$S" ]; then high "SUID/SGID-bestanden in /var, /flash of /tmp:"; printf '%s\n' "$S" | while read -r f; do ls -la "$f"; done | show; else ok "Geen SUID/SGID-bestanden in /var, /flash, /tmp"; fi
+
+# =============================================================================
+section 8 "Accounts en configuratie (ns.conf)"
+# =============================================================================
+for c in $NSCONFS; do
+    [ -f "$c" ] || continue
+    U="$(grep -nE '^(add|set) system user[[:space:]]+sec_monitor' "$c")"
+    [ -n "$U" ] && { high "$c: account 'sec_monitor' aanwezig (update_c08937.pl)"; printf '%s\n' "$U" | show; }
+    SU="$(grep -nE '^bind system user .* superuser' "$c")"
+    out "  -- $c: accounts met superuser-binding (handmatig valideren):"
+    if [ -n "$SU" ]; then printf '%s\n' "$SU" | show; else out "           (geen)"; fi
+    AU="$(grep -nE '^add system user' "$c" | awk '{print $4}' | sort -u | tr '\n' ' ')"
+    info "$c: lokale system users: ${AU:-geen}"
+done
+[ -f /nsconfig/ns.conf ] && [ /nsconfig/ns.conf -nt /flash/nsconfig/ns.conf.0 ] 2>/dev/null && info "ns.conf is nieuwer dan laatste backup ns.conf.0 - vergelijk met 'diff'"
+
+# =============================================================================
+section 9 "Persistence: crontab, rc-scripts, customsnmpd"
+# =============================================================================
+CR="$(grep -hnE 'curl|wget|python|perl|base64|b64decode|nohup|/tmp/|/var/tmp/|sh -c|nc ' /etc/crontab /var/cron/tabs/* 2>/dev/null)"
+if [ -n "$CR" ]; then med "Verdachte crontab-regels:"; printf '%s\n' "$CR" | show; else ok "Crontab: niets verdachts"; fi
+for r in /nsconfig/rc.netscaler /flash/nsconfig/rc.netscaler /nsconfig/nsbefore.sh /nsconfig/nsafter.sh; do
+    [ -f "$r" ] || continue
+    R="$(grep -nE 'python|curl|wget|perl|nohup|base64|b64decode|/tmp/|chmod|httpd' "$r")"
+    [ -n "$R" ] && { high "$r bevat verdachte opstartcommando's:"; printf '%s\n' "$R" | show; }
+done
+if [ -f /var/python/bin/customsnmpd ]; then
+    CS="$(grep -aE 'socket|/bin/sh|dup2|subprocess|45\.141\.21\.130' /var/python/bin/customsnmpd 2>/dev/null)"
+    if [ -n "$CS" ] || file /var/python/bin/customsnmpd | grep -qi 'text'; then
+        high "/var/python/bin/customsnmpd is tekst/bevat reverse-shell code (main.py overwrite)"
+        ls -la /var/python/bin/customsnmpd | show; printf '%s\n' "$CS" | show
+    else
+        ok "/var/python/bin/customsnmpd lijkt niet overschreven"
+    fi
+fi
+
+# =============================================================================
+section 10 "Lopende processen en netwerkverbindingen"
+# =============================================================================
+PS="$(ps auxww 2>/dev/null | grep -E 'python.*(uxd|base64|b64decode|exec\()|nohup|customsnmpd|perl -|/tmp/\.|update_c[0-9]+|lula|main\.py' | grep -v grep)"
+if [ -n "$PS" ]; then high "Verdachte processen (SLAPSHOT / reverse shell / payloads):"; printf '%s\n' "$PS" | show; else ok "Geen verdachte processen"; fi
+IPRE="$(printf '%s\n' "$IOC_IPS" | sed '/^$/d' | cut -d'|' -f1 | sed 's/\./\\./g' | paste -sd'|' -)"
+CONN="$( (sockstat -4 -c 2>/dev/null || netstat -an 2>/dev/null) | grep -E "$IPRE")"
+if [ -n "$CONN" ]; then high "Actieve verbindingen met IOC-IP's:"; printf '%s\n' "$CONN" | show; else ok "Geen actieve verbindingen met IOC-IP's"; fi
+LIS="$(sockstat -4 -l 2>/dev/null | grep -E '127\.0\.0\.1' | grep -iE 'python|perl|sh ')"
+[ -n "$LIS" ] && { high "Python/perl/sh luistert op loopback (SLAPSHOT-gedrag):"; printf '%s\n' "$LIS" | show; }
+
+# =============================================================================
+section 11 "Logs: CVE-2026-88771 (log poisoning / command injection)"
+# =============================================================================
+log_hunt high "Command injection in auth-gebruikersnaam ('authenticate user' + pitboss)" \
+    'authenticate user[^,]*pitboss' $NSLOGS $MSGLOGS
+log_hunt high "pitboss/NSPPE-string met shell-metatekens (\${IFS}, ;, \`, \$(, b64decode)" \
+    'pitboss.*(\$\{IFS\}|b64decode|NSPPE;|`|\$\(|;[[:space:]]*(curl|wget|whoami|id|cat|tar|perl|python|sh|shell|grep|chmod))' $NSLOGS $MSGLOGS
+log_hunt high "'missed too many heartbeats' / 'unexpectedly died' met payload" \
+    '(missed too many heartbeats|unexpectedly died)[^,]*(;|`|\$\{IFS\})' $NSLOGS $MSGLOGS
+log_hunt high "Base64-payload in User-Agent (INDEX: marker, CERT-EU)" \
+    '"INDEX:[A-Za-z0-9+/=]{16,}' $HTTPACC
+log_hunt med "Lange base64-string als User-Agent (Beaumont hunt)" \
+    '"[A-Za-z0-9+/]{80,}={0,2}"[[:space:]]*$' $HTTPACC
+log_hunt high "POST naar /nf/auth/doAuthentication.do met pitboss-payload (Lupovis)" \
+    'doAuthentication\.do.*pitboss' $HTTPACC $NSLOGS
+
+# =============================================================================
+section 12 "Logs: CVE-2026-88772 (DTLS / NSPPE crash)"
+# =============================================================================
+log_hunt high "DTLSv1.0 SSL_HANDSHAKE_FAILURE 'Internal Error' (exploit-artefact)" \
+    'SSL_HANDSHAKE_FAILURE.*DTLSv1\.0.*Internal Error' $NSLOGS $MSGLOGS
+log_hunt high "pitboss 'NOT restarting NSPPE'" \
+    'pitboss.*NOT restarting NSPPE' $MSGLOGS $NSLOGS
+log_hunt med "NSPPE exit with orphan rings / signal 11 / core dump" \
+    'NSPPE-[0-9]+.*(exit with orphan rings|signal 11|core dumped)|ppe-0.*(exited|terminated)' $MSGLOGS $NSLOGS
+CORES="$(find /var/core -type f -newermt "$SINCE" 2>/dev/null)"
+if [ -n "$CORES" ]; then med "NSPPE core dumps sinds $SINCE (bewaar voor forensisch onderzoek!):"; printf '%s\n' "$CORES" | while read -r f; do ls -la "$f"; done | show; else ok "Geen core dumps sinds $SINCE"; fi
+
+# =============================================================================
+section 13 "Logs: webshell-gebruik en post-exploitatie"
+# =============================================================================
+log_hunt high "Requests naar bekende webshell-paden" \
+    '/logon/LogonPoint/(custom/(\.ctxs|receiver\.min)|\.local_journal|xua\.html)|/logon/insight-new\.js|LogonUISimple\.html\.style\.min\.css|/vpn/scripts/linux/[^ ]*\.(deb|sig|php)|\.php\?0=|/vpn/theme/[^ ]*\.php' $HTTPACC $HTTPERR
+log_hunt high "NetScaler-header/cookie C2 (NSC_TASS, HTTP_X_UX, nsgclient)" \
+    'NSC_TASS|X-UX|nsgclient\.ico|nsginstaller' $HTTPACC $HTTPERR
+# 404 met grote response op /vpn/media|scripts|theme (Mandiant)
+for f in $HTTPACC; do
+    [ -f "$f" ] || continue
+    case "$f" in *.gz) CAT="gzip -dc" ;; *) CAT="cat" ;; esac
+    BIG="$($CAT "$f" 2>/dev/null | grep -aE '/vpn/media/|/vpn/scripts/|/vpn/theme/' | awk '($9 ~ /^(200|404)$/) && ($10+0 > 5000)')"
+    [ -n "$BIG" ] && { high "$(basename "$f"): /vpn/media|scripts|theme met 200/404 en >5KB response (WHIPSHOT-patroon)"; printf '%s\n' "$BIG" | show; }
+done
+log_hunt med "httperror: PHP-/parse-fouten of niet-standaard extensies (.deb/.sig/.ico)" \
+    '(PHP (Parse|Fatal|Warning)|File does not exist).*\.(deb|sig|rpm|tgz|ico|css)' $HTTPERR
+SIG="$(lgrep 'SIGHUP received' $HTTPERR | grep -vE ':00:0[0-9]')"
+[ -n "$SIG" ] && { med "httpd 'SIGHUP received' buiten de normale hh:00:0x graceful restarts:"; printf '%s\n' "$SIG" | show; }
+log_hunt high "Shell-history: herstart/permissie/download commando's" \
+    'nsshutdown -R|httpd -k restart|chmod (u\+s|6555|4755)[[:space:]]+/bin/sh|b64decode|base64 -d|curl[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*https?://[0-9]|wget[[:space:]]|/tmp/\.uxd|update_c[0-9]+\.pl|main\.py' $SHLOGS
+log_hunt high "Verwijzing naar bekende payload-URL's/bestanden in logs" \
+    'xd7h/x|update_c08937|update_result_3567cs|/lula|main\.py|customsnmpd' $ALLLOGS
+
+# =============================================================================
+section 14 "Logs: bekende IOC-IP's en domeinen"
+# =============================================================================
+IPHITS=0
+while IFS='|' read -r ip d; do
+    [ -z "$ip" ] && continue
+    pat="$(printf '%s' "$ip" | sed 's/\./\\./g')"
+    hits="$(lgrep "(^|[^0-9])${pat}([^0-9]|$)" $ALLLOGS)"
+    if [ -n "$hits" ]; then
+        IPHITS=$((IPHITS+1))
+        n="$(printf '%s\n' "$hits" | wc -l | tr -d ' ')"
+        high "IOC-IP $ip ($d): $n regels"
+        printf '%s\n' "$hits" | head -n 10 | sed 's/^/           | /' | tee -a "$REPORT"
+    fi
+done <<< "$IOC_IPS"
+[ "$IPHITS" -eq 0 ] && ok "Geen van de $(printf '%s\n' "$IOC_IPS" | grep -c '|') IOC-IP's in lokale logs"
+log_hunt high "Domein-IOC $IOC_DOMAINS" 'httpworkbench\.com' $ALLLOGS
+
+# =============================================================================
+section 15 "Log-integriteit (anti-forensics)"
+# =============================================================================
+for f in /var/log/ns.log /var/log/httpaccess.log /var/log/messages /var/log/sh.log; do
+    [ -f "$f" ] || continue
+    sz="$(wc -c < "$f" | tr -d ' ')"
+    first="$(head -1 "$f" 2>/dev/null | cut -c1-60)"
+    out "  $f: ${sz} bytes, eerste regel: $first"
+    [ "$sz" -eq 0 ] && med "$f is leeg - mogelijk gewist"
+done
+OLDEST="$(ls -tr /var/log/ns.log* 2>/dev/null | head -1)"
+info "Oudste ns.log: ${OLDEST:-n.v.t.} - als logs al geroteerd zijn sinds begin september, hunt in de SIEM (syslog-forwarding)"
+
+# =============================================================================
+section 16 "SAMENVATTING"
+# =============================================================================
+out "  HIGH:   $HIGH"
+out "  MEDIUM: $MED"
+out "  INFO:   $INFO"
+out ""
+if [ "$HIGH" -gt 0 ]; then
+    out "  OORDEEL: MOGELIJK GECOMPROMITTEERD."
+    out "  -> Isoleer de appliance, stop HA-sync, bewaar memory/disk/logs, start incident response."
+    out "  -> Na patch: roteer ALLE credentials (nsroot, LDAP-bind, RADIUS, SSH-keys, TLS-keys),"
+    out "     beeindig sessies (kill aaa/icaconnection), controleer StoreFront/DDC/AD op laterale beweging."
+elif [ "$MED" -gt 0 ]; then
+    out "  OORDEEL: VERDACHT - handmatige analyse van de [MEDIUM]-bevindingen vereist."
+else
+    out "  OORDEEL: geen bekende IOC's gevonden. Dit sluit compromittering NIET uit"
+    out "  (unieke webshells per slachtoffer, logrotatie, anti-forensics). Hunt ook in SIEM/firewall."
+fi
+out ""
+out "Rapport opgeslagen in: $REPORT"
+exit "$HIGH"
